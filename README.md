@@ -49,11 +49,11 @@ Updates installed by Sparkle after that don't need this.
 2. Tag and push: `git tag v0.2.0 && git push origin v0.2.0`.
 3. The **Release** workflow builds a universal app, signs it, makes the DMG, writes `appcast.xml`, and publishes both to a GitHub release.
 
-The installed app checks `releases/latest/download/appcast.xml` once a day and installs new versions in the background. **Settings → Check for updates** checks right away.
+With the Sparkle keys set (below), the installed app checks `releases/latest/download/appcast.xml` once a day and installs new versions in the background. **Settings → Check for updates** checks right away.
 
-### One-time setup for auto-update
+### Optional: auto-update
 
-Sparkle only installs updates signed with your EdDSA key.
+Without Sparkle keys, releases ship without Sparkle: the app doesn't update itself, and you install new versions from Releases by hand. To turn self-update on, set up the keys once. Sparkle only installs updates signed with your EdDSA key.
 
 1. Download [Sparkle 2.7.1](https://github.com/sparkle-project/Sparkle/releases/tag/2.7.1) and run `./bin/generate_keys` on your Mac. It stores the private key in your Keychain and prints the public key.
 2. Export the private key: `./bin/generate_keys -x sparkle_private_key.txt`.
