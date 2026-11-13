@@ -107,6 +107,8 @@ struct Patina {
     /// Where the user is dragging the progress slider, before release.
     seek_to: Option<u32>,
     art: HashMap<String, image::Handle>,
+    /// Encoded covers, by URL, for Control Center.
+    art_bytes: HashMap<String, Vec<u8>>,
     /// Loaded playlist tracks, by playlist id.
     playlist_tracks: HashMap<String, Vec<Track>>,
     settings: Settings,
@@ -132,6 +134,7 @@ impl Patina {
             position_ms: 0,
             seek_to: None,
             art: HashMap::new(),
+            art_bytes: HashMap::new(),
             playlist_tracks: HashMap::new(),
             settings: Settings::load(),
             error: None,
@@ -164,6 +167,7 @@ impl Patina {
         let jumped = matches!(
             message,
             Message::SeekDone
+                | Message::ArtLoaded(..)
                 | Message::Media(media::Command::Seek(_))
                 | Message::Playback(PlaybackEvent::Playing { .. } | PlaybackEvent::Paused { .. })
         );
@@ -181,13 +185,20 @@ impl Patina {
     }
 
     fn publish_now_playing(&self) {
-        media::publish(self.now_playing().map(|track| media::NowPlaying {
-            title: &track.title,
-            artist: &track.artist,
-            album: &track.album,
-            duration_ms: track.duration_ms,
-            position_ms: self.position_ms,
-            playing: self.playing,
+        media::publish(self.now_playing().map(|track| {
+            media::NowPlaying {
+                title: &track.title,
+                artist: &track.artist,
+                album: &track.album,
+                duration_ms: track.duration_ms,
+                position_ms: self.position_ms,
+                playing: self.playing,
+                artwork: track
+                    .art_url
+                    .as_ref()
+                    .and_then(|url| self.art_bytes.get(url))
+                    .map(Vec::as_slice),
+            }
         }));
     }
 
@@ -395,7 +406,9 @@ impl Patina {
             Message::ArtLoaded(url, result) => {
                 match result {
                     Ok(bytes) => {
-                        self.art.insert(url, image::Handle::from_bytes(bytes));
+                        self.art
+                            .insert(url.clone(), image::Handle::from_bytes(bytes.clone()));
+                        self.art_bytes.insert(url, bytes);
                     }
                     Err(e) => tracing::warn!("album art failed: {e}"),
                 }

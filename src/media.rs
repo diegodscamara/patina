@@ -33,6 +33,8 @@ pub struct NowPlaying<'a> {
     pub duration_ms: u32,
     pub position_ms: u32,
     pub playing: bool,
+    /// Encoded cover image (JPEG or PNG), if it has loaded.
+    pub artwork: Option<&'a [u8]>,
 }
 
 #[cfg(target_os = "macos")]
@@ -42,15 +44,19 @@ mod imp {
 
     use block2::RcBlock;
     use iced::futures::channel::mpsc::{self, UnboundedReceiver, UnboundedSender};
+    use objc2::AllocAnyThread;
     use objc2::rc::Retained;
     use objc2::runtime::AnyObject;
-    use objc2_foundation::{NSDictionary, NSNumber, NSString};
+    use objc2_app_kit::NSImage;
+    use objc2_core_foundation::CGSize;
+    use objc2_foundation::{NSData, NSDictionary, NSNumber, NSString};
     use objc2_media_player::{
-        MPChangePlaybackPositionCommandEvent, MPMediaItemPropertyAlbumTitle,
-        MPMediaItemPropertyArtist, MPMediaItemPropertyPlaybackDuration, MPMediaItemPropertyTitle,
-        MPNowPlayingInfoCenter, MPNowPlayingInfoPropertyElapsedPlaybackTime,
-        MPNowPlayingInfoPropertyPlaybackRate, MPNowPlayingPlaybackState, MPRemoteCommand,
-        MPRemoteCommandCenter, MPRemoteCommandEvent, MPRemoteCommandHandlerStatus,
+        MPChangePlaybackPositionCommandEvent, MPMediaItemArtwork, MPMediaItemPropertyAlbumTitle,
+        MPMediaItemPropertyArtist, MPMediaItemPropertyArtwork, MPMediaItemPropertyPlaybackDuration,
+        MPMediaItemPropertyTitle, MPNowPlayingInfoCenter,
+        MPNowPlayingInfoPropertyElapsedPlaybackTime, MPNowPlayingInfoPropertyPlaybackRate,
+        MPNowPlayingPlaybackState, MPRemoteCommand, MPRemoteCommandCenter, MPRemoteCommandEvent,
+        MPRemoteCommandHandlerStatus,
     };
 
     use super::{Command, NowPlaying};
@@ -121,6 +127,22 @@ mod imp {
         unsafe { Retained::cast_unchecked(value) }
     }
 
+    /// Wraps an encoded image for Control Center.
+    fn artwork(bytes: &[u8]) -> Option<Retained<MPMediaItemArtwork>> {
+        let image = NSImage::initWithData(NSImage::alloc(), &NSData::with_bytes(bytes))?;
+        let size = image.size();
+        // The block owns the image, and the artwork owns the block, so the
+        // pointer we hand back stays valid for as long as anyone can ask.
+        let handler = RcBlock::new(move |_size: CGSize| NonNull::from(&*image));
+        Some(unsafe {
+            MPMediaItemArtwork::initWithBoundsSize_requestHandler(
+                MPMediaItemArtwork::alloc(),
+                size,
+                &handler,
+            )
+        })
+    }
+
     pub fn publish(now: Option<NowPlaying<'_>>) {
         let center = unsafe { MPNowPlayingInfoCenter::defaultCenter() };
         let Some(now) = now else {
@@ -131,7 +153,7 @@ mod imp {
             return;
         };
 
-        let keys: [&NSString; 6] = unsafe {
+        let mut keys: Vec<&NSString> = unsafe {
             [
                 MPMediaItemPropertyTitle,
                 MPMediaItemPropertyArtist,
@@ -140,8 +162,9 @@ mod imp {
                 MPNowPlayingInfoPropertyElapsedPlaybackTime,
                 MPNowPlayingInfoPropertyPlaybackRate,
             ]
+            .to_vec()
         };
-        let values = [
+        let mut values = vec![
             object(NSString::from_str(now.title)),
             object(NSString::from_str(now.artist)),
             object(NSString::from_str(now.album)),
@@ -149,6 +172,10 @@ mod imp {
             object(NSNumber::new_f64(f64::from(now.position_ms) / 1000.0)),
             object(NSNumber::new_f64(if now.playing { 1.0 } else { 0.0 })),
         ];
+        if let Some(artwork) = now.artwork.and_then(artwork) {
+            keys.push(unsafe { MPMediaItemPropertyArtwork });
+            values.push(object(artwork));
+        }
         let info = NSDictionary::from_retained_objects(&keys, &values);
         let state = if now.playing {
             MPNowPlayingPlaybackState::Playing
