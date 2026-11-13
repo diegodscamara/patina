@@ -723,7 +723,7 @@ impl Patina {
         let updates = if updater::available() {
             "Updates install automatically from GitHub Releases."
         } else {
-            "Updates are off when running outside the installed app."
+            "Automatic updates are off in this build. Install new versions from GitHub Releases."
         };
 
         column![

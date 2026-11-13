@@ -9,7 +9,8 @@
 # Optional environment:
 #   PATINA_VERSION         version string (default: from Cargo.toml)
 #   PATINA_FEED_URL        Sparkle appcast URL (default: this repo's latest release)
-#   SPARKLE_PUBLIC_KEY     EdDSA public key written to Info.plist
+#   SPARKLE_PUBLIC_KEY     EdDSA public key written to Info.plist; without it the app
+#                          ships without Sparkle and doesn't update itself
 #   SPARKLE_PRIVATE_KEY    EdDSA private key; when set, dist/appcast.xml is written
 #   DEVELOPER_ID           "Developer ID Application: Name (TEAMID)"; ad-hoc signing when unset
 #   APPLE_ID, APPLE_TEAM_ID, APPLE_APP_PASSWORD   notarize when all three are set
@@ -55,20 +56,31 @@ sed -e "s|@VERSION@|$VERSION|g" \
     -e "s|@FEED_URL@|$FEED_URL|g" \
     -e "s|@ED_PUBLIC_KEY@|${SPARKLE_PUBLIC_KEY:-}|g" \
     "$ROOT/packaging/Info.plist" > "$APP/Contents/Info.plist"
+if [[ -z "${SPARKLE_PUBLIC_KEY:-}" ]]; then
+  # Without a key Sparkle can't verify updates and would complain at launch,
+  # so leave it out entirely.
+  for key in SUFeedURL SUPublicEDKey SUEnableAutomaticChecks SUAutomaticallyUpdate SUScheduledCheckInterval; do
+    plutil -remove "$key" "$APP/Contents/Info.plist"
+  done
+fi
 plutil -lint "$APP/Contents/Info.plist"
 
 # --- Sparkle -------------------------------------------------------------
-# Kept outside target/: CI's Rust cache saves target/ and restores the framework
-# without its symlinks, which codesign then rejects.
-SPARKLE_DIR="$ROOT/.build/sparkle-$SPARKLE_VERSION"
-if [[ ! -L "$SPARKLE_DIR/Sparkle.framework/Versions/Current" ]]; then
-  rm -rf "$SPARKLE_DIR"
-  log "Downloading Sparkle $SPARKLE_VERSION"
-  mkdir -p "$SPARKLE_DIR"
-  curl -fsSL "https://github.com/sparkle-project/Sparkle/releases/download/$SPARKLE_VERSION/Sparkle-$SPARKLE_VERSION.tar.xz" \
-    | tar -xJ -C "$SPARKLE_DIR"
+if [[ -n "${SPARKLE_PUBLIC_KEY:-}" ]]; then
+  # Kept outside target/: CI's Rust cache saves target/ and restores the framework
+  # without its symlinks, which codesign then rejects.
+  SPARKLE_DIR="$ROOT/.build/sparkle-$SPARKLE_VERSION"
+  if [[ ! -L "$SPARKLE_DIR/Sparkle.framework/Versions/Current" ]]; then
+    rm -rf "$SPARKLE_DIR"
+    log "Downloading Sparkle $SPARKLE_VERSION"
+    mkdir -p "$SPARKLE_DIR"
+    curl -fsSL "https://github.com/sparkle-project/Sparkle/releases/download/$SPARKLE_VERSION/Sparkle-$SPARKLE_VERSION.tar.xz" \
+      | tar -xJ -C "$SPARKLE_DIR"
+  fi
+  ditto "$SPARKLE_DIR/Sparkle.framework" "$APP/Contents/Frameworks/Sparkle.framework"
+else
+  log "No SPARKLE_PUBLIC_KEY: building without self-update"
 fi
-ditto "$SPARKLE_DIR/Sparkle.framework" "$APP/Contents/Frameworks/Sparkle.framework"
 # Patina loads the framework at runtime from Contents/Frameworks (src/updater.rs),
 # so the binary doesn't link against it.
 
@@ -76,12 +88,14 @@ ditto "$SPARKLE_DIR/Sparkle.framework" "$APP/Contents/Frameworks/Sparkle.framewo
 if [[ -n "${DEVELOPER_ID:-}" ]]; then
   log "Signing with $DEVELOPER_ID"
   SIGN=(codesign --force --timestamp --options runtime --sign "$DEVELOPER_ID")
-  FW="$APP/Contents/Frameworks/Sparkle.framework/Versions/B"
-  "${SIGN[@]}" "$FW/XPCServices/Installer.xpc"
-  "${SIGN[@]}" --preserve-metadata=entitlements "$FW/XPCServices/Downloader.xpc"
-  "${SIGN[@]}" "$FW/Autoupdate"
-  "${SIGN[@]}" "$FW/Updater.app"
-  "${SIGN[@]}" "$APP/Contents/Frameworks/Sparkle.framework"
+  if [[ -d "$APP/Contents/Frameworks/Sparkle.framework" ]]; then
+    FW="$APP/Contents/Frameworks/Sparkle.framework/Versions/B"
+    "${SIGN[@]}" "$FW/XPCServices/Installer.xpc"
+    "${SIGN[@]}" --preserve-metadata=entitlements "$FW/XPCServices/Downloader.xpc"
+    "${SIGN[@]}" "$FW/Autoupdate"
+    "${SIGN[@]}" "$FW/Updater.app"
+    "${SIGN[@]}" "$APP/Contents/Frameworks/Sparkle.framework"
+  fi
   "${SIGN[@]}" --entitlements "$ROOT/packaging/Patina.entitlements" "$APP"
 else
   log "Signing ad-hoc (no DEVELOPER_ID)"
@@ -107,7 +121,7 @@ if [[ -n "${DEVELOPER_ID:-}" && -n "${APPLE_ID:-}" && -n "${APPLE_TEAM_ID:-}" &&
 fi
 
 # --- Appcast -------------------------------------------------------------
-if [[ -n "${SPARKLE_PRIVATE_KEY:-}" ]]; then
+if [[ -n "${SPARKLE_PRIVATE_KEY:-}" && -n "${SPARKLE_PUBLIC_KEY:-}" ]]; then
   log "Writing appcast.xml"
   KEY_FILE="$(mktemp)"
   trap 'rm -f "$KEY_FILE"' EXIT
