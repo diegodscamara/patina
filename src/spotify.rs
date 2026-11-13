@@ -24,8 +24,9 @@ use librespot::oauth::OAuthClientBuilder;
 use librespot::playback::audio_backend;
 use librespot::playback::config::{AudioFormat, Bitrate, PlayerConfig};
 use librespot::playback::mixer::NoOpVolume;
-use librespot::playback::player::Player;
-use rspotify::clients::OAuthClient;
+use librespot::playback::player::{Player, PlayerEvent};
+use rspotify::clients::{BaseClient, OAuthClient};
+use rspotify::model::{FullTrack, SearchResult, SearchType};
 use rspotify::{AuthCodeSpotify, Token};
 
 /// Port for the OAuth redirect listener. Must match librespot's registered
@@ -57,7 +58,58 @@ pub struct Track {
     pub id: String,
     pub title: String,
     pub artist: String,
+    pub album: String,
+    /// Largest album cover Spotify offers, if any.
+    pub art_url: Option<String>,
     pub duration_ms: u32,
+}
+
+impl Track {
+    fn from_full(track: FullTrack) -> Option<Self> {
+        Some(Self {
+            id: track.id?.to_string(),
+            title: track.name,
+            artist: track
+                .artists
+                .iter()
+                .map(|a| a.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+            art_url: track
+                .album
+                .images
+                .iter()
+                .max_by_key(|i| i.width.unwrap_or(0))
+                .map(|i| i.url.clone()),
+            album: track.album.name,
+            duration_ms: track.duration.num_milliseconds().max(0) as u32,
+        })
+    }
+}
+
+/// What the player reports back, reduced to what the UI needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlaybackEvent {
+    Playing { position_ms: u32 },
+    Paused { position_ms: u32 },
+    Position { position_ms: u32 },
+    EndOfTrack,
+    Unavailable,
+}
+
+impl PlaybackEvent {
+    fn from_player(event: PlayerEvent) -> Option<Self> {
+        Some(match event {
+            PlayerEvent::Playing { position_ms, .. } => Self::Playing { position_ms },
+            PlayerEvent::Paused { position_ms, .. } => Self::Paused { position_ms },
+            PlayerEvent::PositionChanged { position_ms, .. }
+            | PlayerEvent::PositionCorrection { position_ms, .. }
+            | PlayerEvent::Seeked { position_ms, .. } => Self::Position { position_ms },
+            PlayerEvent::EndOfTrack { .. } => Self::EndOfTrack,
+            PlayerEvent::Unavailable { .. } => Self::Unavailable,
+            _ => return None,
+        })
+    }
 }
 
 /// A playlist row for the sidebar.
@@ -135,6 +187,7 @@ impl Spotify {
             bitrate: Bitrate::Bitrate320,
             gapless: true,
             normalisation: true,
+            position_update_interval: Some(std::time::Duration::from_secs(1)),
             ..PlayerConfig::default()
         };
         let backend = audio_backend::find(None).ok_or_else(|| anyhow!("no audio backend"))?;
@@ -173,21 +226,7 @@ impl Spotify {
         Ok(page
             .items
             .into_iter()
-            .filter_map(|saved| {
-                let track = saved.track;
-                let id = track.id?.to_string();
-                Some(Track {
-                    id,
-                    title: track.name,
-                    artist: track
-                        .artists
-                        .iter()
-                        .map(|a| a.name.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                    duration_ms: track.duration.num_milliseconds().max(0) as u32,
-                })
-            })
+            .filter_map(|saved| Track::from_full(saved.track))
             .collect())
     }
 
@@ -203,6 +242,45 @@ impl Spotify {
                 name: p.name,
             })
             .collect())
+    }
+
+    /// Searches tracks.
+    pub async fn search(&self, query: &str) -> Result<Vec<Track>> {
+        let api = self.web_api().await?;
+        let result = api
+            .search(query, SearchType::Track, None, None, Some(30), Some(0))
+            .await?;
+        Ok(match result {
+            SearchResult::Tracks(page) => page
+                .items
+                .into_iter()
+                .filter_map(Track::from_full)
+                .collect(),
+            _ => Vec::new(),
+        })
+    }
+
+    /// Downloads an image, e.g. album art.
+    pub async fn fetch_image(url: &str) -> Result<Vec<u8>> {
+        let bytes = reqwest::get(url).await?.error_for_status()?.bytes().await?;
+        Ok(bytes.to_vec())
+    }
+
+    /// Player events as a stream. Each call takes a new channel.
+    pub fn events(&self) -> impl iced::futures::Stream<Item = PlaybackEvent> + Send + 'static {
+        let channel = self.player.get_player_event_channel();
+        iced::futures::stream::unfold(channel, |mut rx| async move {
+            loop {
+                let event = rx.recv().await?;
+                if let Some(event) = PlaybackEvent::from_player(event) {
+                    return Some((event, rx));
+                }
+            }
+        })
+    }
+
+    pub fn seek(&self, position_ms: u32) {
+        self.player.seek(position_ms);
     }
 
     /// Starts a track. `uri` is a `spotify:track:...` URI.
