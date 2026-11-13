@@ -29,6 +29,8 @@ Sign-in uses librespot's own client ID rather than your developer app, because S
 | ⌘ F | Search |
 | ⌘ 1 / ⌘ 2 / ⌘ , | Library / Now playing / Settings |
 
+The Mac's media keys (and AirPods, Control Center) also control Patina, and Control Center shows what's playing.
+
 ## Install
 
 Grab `Patina-<version>.dmg` from [Releases](https://github.com/diegodscamara/patina/releases) and drag Patina into Applications.
@@ -83,6 +85,7 @@ PATINA_ARCHS=native scripts/package.sh   # dist/Patina-<version>.dmg
 | `src/main.rs` | App state, update loop and views |
 | `src/spotify.rs` | Sign-in, librespot player, Web API calls |
 | `src/updater.rs` | Starts Sparkle when running from the installed app |
+| `src/media.rs` | Media keys and Control Center's Now Playing (MediaPlayer framework) |
 | `src/settings.rs` | Preferences kept between launches (volume) |
 | `src/theme.rs` | Colours |
 | `assets/icon/` | Worn groove icon (SVG source, 1024 px PNG, `.icns`, menu bar glyph) |
