@@ -1,0 +1,27 @@
+[package]
+name = "patina"
+version = "0.1.0"
+edition = "2024"
+description = "A small, native Spotify player for macOS"
+publish = false
+
+[dependencies]
+anyhow = "1.0.104"
+directories = "6"
+iced = { version = "0.14", features = ["tokio", "image", "svg", "advanced"] }
+librespot = "0.8"
+rspotify = { version = "0.16", default-features = false, features = ["client-reqwest", "reqwest-rustls-tls"] }
+serde = { version = "1.0.229", features = ["derive"] }
+tokio = { version = "1.54.1", features = ["full"] }
+toml = "1.2.1"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = "0.3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
