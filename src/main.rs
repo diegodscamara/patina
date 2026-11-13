@@ -64,6 +64,7 @@ enum Account {
 #[derive(Debug, Clone)]
 enum Message {
     SignIn,
+    SignOut,
     Connected(Result<Arc<Spotify>, String>),
     LikedLoaded(Result<Vec<Track>, String>),
     PlaylistsLoaded(Result<Vec<Playlist>, String>),
@@ -208,6 +209,25 @@ impl Patina {
                 self.account = Account::Connecting;
                 connect(true)
             }
+            Message::SignOut => {
+                if let Some(client) = self.client()
+                    && let Err(e) = client.sign_out()
+                {
+                    tracing::warn!("sign out: {e:#}");
+                }
+                self.account = Account::SignedOut;
+                self.liked.clear();
+                self.playlists.clear();
+                self.playlist_tracks.clear();
+                self.results.clear();
+                self.queue.clear();
+                self.current = None;
+                self.playing = false;
+                self.position_ms = 0;
+                self.error = None;
+                self.page = Page::Library;
+                Task::none()
+            }
             Message::Connected(Ok(client)) => {
                 client.set_volume(self.settings.volume);
                 self.account = Account::Connected(client.clone());
@@ -215,11 +235,11 @@ impl Patina {
                 let lists = client.clone();
                 Task::batch([
                     Task::perform(
-                        async move { liked.liked_songs().await.map_err(|e| e.to_string()) },
+                        async move { liked.liked_songs().await.map_err(|e| spotify::friendly(&e)) },
                         Message::LikedLoaded,
                     ),
                     Task::perform(
-                        async move { lists.playlists().await.map_err(|e| e.to_string()) },
+                        async move { lists.playlists().await.map_err(|e| spotify::friendly(&e)) },
                         Message::PlaylistsLoaded,
                     ),
                     Task::run(client.events(), Message::Playback),
@@ -260,7 +280,12 @@ impl Patina {
                 }
                 self.searching = true;
                 Task::perform(
-                    async move { client.search(&query).await.map_err(|e| e.to_string()) },
+                    async move {
+                        client
+                            .search(&query)
+                            .await
+                            .map_err(|e| spotify::friendly(&e))
+                    },
                     Message::SearchLoaded,
                 )
             }
@@ -293,7 +318,12 @@ impl Patina {
                 Task::perform(
                     {
                         let id = id.clone();
-                        async move { client.playlist_tracks(&id).await.map_err(|e| e.to_string()) }
+                        async move {
+                            client
+                                .playlist_tracks(&id)
+                                .await
+                                .map_err(|e| spotify::friendly(&e))
+                        }
                     },
                     move |result| Message::PlaylistLoaded(id.clone(), result),
                 )
@@ -472,7 +502,11 @@ impl Patina {
             Some(url) if !self.art.contains_key(&url) => Task::perform(
                 {
                     let url = url.clone();
-                    async move { Spotify::fetch_image(&url).await.map_err(|e| e.to_string()) }
+                    async move {
+                        Spotify::fetch_image(&url)
+                            .await
+                            .map_err(|e| spotify::friendly(&e))
+                    }
                 },
                 move |result| Message::ArtLoaded(url.clone(), result),
             ),
@@ -729,6 +763,9 @@ impl Patina {
         column![
             text("Settings").size(30).color(theme::BONE),
             text(account).size(14),
+            button(text("Sign out").size(13))
+                .padding([6, 12])
+                .on_press_maybe(self.client().map(|_| Message::SignOut)),
             Space::new().height(8),
             text(format!("Version {}", env!("CARGO_PKG_VERSION"))).size(14),
             text(updates).size(13).color(theme::ASH),
@@ -934,7 +971,10 @@ fn connect(allow_browser: bool) -> Task<Message> {
             Spotify::connect(allow_browser)
                 .await
                 .map(Arc::new)
-                .map_err(|e| e.to_string())
+                .map_err(|e| {
+                    tracing::warn!("connecting failed: {e:#}");
+                    format!("Couldn't connect to Spotify: {e}")
+                })
         },
         Message::Connected,
     )

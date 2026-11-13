@@ -214,18 +214,45 @@ impl Spotify {
         })
     }
 
+    /// Stops playback, ends the session and forgets the saved sign-in, so
+    /// the next sign-in goes through the browser again.
+    pub fn sign_out(&self) -> Result<()> {
+        self.player.stop();
+        self.session.shutdown();
+        let saved = cache_dir()?.join("credentials.json");
+        match std::fs::remove_file(&saved) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                Err(e).with_context(|| format!("removing {}", saved.display()))
+            }
+            _ => Ok(()),
+        }
+    }
+
     pub fn username(&self) -> String {
         self.session.username()
     }
 
+    /// A Web API client with a fresh access token.
+    ///
+    /// Spotify no longer hands out Web API tokens through keymaster for this
+    /// client ID (it answers 403), so the token comes from login5, which
+    /// exchanges the stored sign-in for a token with the sign-in's scopes.
+    /// Keymaster stays as a fallback in case login5 is unavailable.
     async fn web_api(&self) -> Result<AuthCodeSpotify> {
-        let token = self
-            .session
-            .token_provider()
-            .get_token(WEB_API_SCOPES)
-            .await?;
+        let access_token = match self.session.login5().auth_token().await {
+            Ok(token) => token.access_token,
+            Err(login5) => {
+                tracing::warn!("login5 token failed, trying keymaster: {login5}");
+                self.session
+                    .token_provider()
+                    .get_token(WEB_API_SCOPES)
+                    .await
+                    .map_err(|e| anyhow!(ApiError::Token).context(e))?
+                    .access_token
+            }
+        };
         Ok(AuthCodeSpotify::from_token(Token {
-            access_token: token.access_token,
+            access_token,
             ..Token::default()
         }))
     }
@@ -355,5 +382,65 @@ impl Spotify {
 
     pub fn resume(&self) {
         self.player.play();
+    }
+}
+
+/// Errors worth a specific message in the UI.
+#[derive(Debug)]
+pub enum ApiError {
+    Token,
+}
+
+impl std::fmt::Display for ApiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Token => f.write_str("Spotify refused a library token"),
+        }
+    }
+}
+
+impl std::error::Error for ApiError {}
+
+/// A short, human message for an error from this module. The full error goes
+/// to the log.
+pub fn friendly(error: &anyhow::Error) -> String {
+    tracing::warn!("Spotify request failed: {error:#}");
+    let detail = format!("{error:#}").to_lowercase();
+    if error
+        .chain()
+        .any(|e| e.downcast_ref::<ApiError>().is_some())
+        || detail.contains("401")
+        || detail.contains("403")
+    {
+        "Spotify wouldn't let Patina load your library. Sign out in Settings and sign in \
+         again."
+            .to_string()
+    } else if detail.contains("429") {
+        "Spotify is getting too many requests. Try again in a minute.".to_string()
+    } else if detail.contains("dns")
+        || detail.contains("connect")
+        || detail.contains("timed out")
+        || detail.contains("network")
+    {
+        "Can't reach Spotify. Check your internet connection.".to_string()
+    } else {
+        "Something went wrong talking to Spotify. Try again in a moment.".to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn friendly_errors() {
+        let refused = anyhow!(ApiError::Token).context("Service unavailable");
+        assert!(friendly(&refused).starts_with("Spotify wouldn't let Patina"));
+        let forbidden = anyhow!("http status: 403");
+        assert!(friendly(&forbidden).starts_with("Spotify wouldn't let Patina"));
+        let limited = anyhow!("http status: 429");
+        assert!(friendly(&limited).contains("too many requests"));
+        let other = anyhow!("something odd");
+        assert!(friendly(&other).starts_with("Something went wrong"));
     }
 }
