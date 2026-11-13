@@ -21,6 +21,8 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
 objc2-foundation = "0.3"
+block2 = "0.6"
+objc2-media-player = { version = "0.3", default-features = false, features = ["std", "block2", "MPRemoteCommandCenter", "MPRemoteCommand", "MPRemoteCommandEvent", "MPNowPlayingInfoCenter", "MPMediaItem"] }
 
 [profile.release]
 lto = "thin"

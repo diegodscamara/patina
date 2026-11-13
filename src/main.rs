@@ -1,6 +1,7 @@
 //! Patina: a small, native Spotify player for macOS.
 
 mod icons;
+mod media;
 mod settings;
 mod spotify;
 mod theme;
@@ -79,6 +80,7 @@ enum Message {
     VolumeStep(f32),
     VolumeDone,
     FocusSearch,
+    Media(media::Command),
     TogglePlay,
     Next,
     Previous,
@@ -114,6 +116,7 @@ struct Patina {
 impl Patina {
     fn boot() -> (Self, Task<Message>) {
         updater::start();
+        media::start();
 
         let mut state = Self {
             account: Account::SignedOut,
@@ -156,6 +159,39 @@ impl Patina {
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
+        // Control Center extrapolates progress from the playback rate, so it
+        // only needs news when the track, play state or position jumps.
+        let jumped = matches!(
+            message,
+            Message::SeekDone
+                | Message::Media(media::Command::Seek(_))
+                | Message::Playback(PlaybackEvent::Playing { .. } | PlaybackEvent::Paused { .. })
+        );
+        let before = self.media_state();
+        let task = self.handle(message);
+        if jumped || self.media_state() != before {
+            self.publish_now_playing();
+        }
+        task
+    }
+
+    /// What Control Center cares about, to tell when it needs an update.
+    fn media_state(&self) -> (Option<String>, bool) {
+        (self.now_playing().map(|t| t.id.clone()), self.playing)
+    }
+
+    fn publish_now_playing(&self) {
+        media::publish(self.now_playing().map(|track| media::NowPlaying {
+            title: &track.title,
+            artist: &track.artist,
+            album: &track.album,
+            duration_ms: track.duration_ms,
+            position_ms: self.position_ms,
+            playing: self.playing,
+        }));
+    }
+
+    fn handle(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::SignIn => {
                 self.account = Account::Connecting;
@@ -284,6 +320,21 @@ impl Patina {
                 self.page = Page::Search;
                 iced::widget::operation::focus(SEARCH_INPUT)
             }
+            Message::Media(command) => match command {
+                media::Command::Play if !self.playing => self.handle(Message::TogglePlay),
+                media::Command::Pause if self.playing => self.handle(Message::TogglePlay),
+                media::Command::Play | media::Command::Pause => Task::none(),
+                media::Command::Toggle => self.handle(Message::TogglePlay),
+                media::Command::Next => self.handle(Message::Next),
+                media::Command::Previous => self.handle(Message::Previous),
+                media::Command::Seek(ms) => {
+                    if let Some(client) = self.client() {
+                        client.seek(ms);
+                        self.position_ms = ms;
+                    }
+                    Task::none()
+                }
+            },
             Message::TogglePlay => {
                 let Some(client) = self.client() else {
                     return Task::none();
@@ -358,13 +409,16 @@ impl Patina {
     }
 
     fn subscription(&self) -> Subscription<Message> {
-        event::listen_with(|event, status, _window| match (event, status) {
-            (
-                iced::Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. }),
-                event::Status::Ignored,
-            ) => shortcut(key.as_ref(), modifiers),
-            _ => None,
-        })
+        Subscription::batch([
+            event::listen_with(|event, status, _window| match (event, status) {
+                (
+                    iced::Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. }),
+                    event::Status::Ignored,
+                ) => shortcut(key.as_ref(), modifiers),
+                _ => None,
+            }),
+            Subscription::run(media::commands).map(Message::Media),
+        ])
     }
 
     fn set_volume(&mut self, volume: f32) {
