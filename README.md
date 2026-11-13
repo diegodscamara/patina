@@ -19,6 +19,16 @@ Click **Sign in with Spotify**. Your browser opens Spotify's login page and redi
 
 Sign-in uses librespot's own client ID rather than your developer app, because Spotify only grants the `streaming` scope to its own clients. Your developer app is still useful later if we want Web API calls on a separate rate limit.
 
+## Keyboard
+
+| Keys | Action |
+| --- | --- |
+| Space | Play / pause |
+| ⌘ → / ⌘ ← | Next / previous track |
+| ⌘ ↑ / ⌘ ↓ | Volume up / down |
+| ⌘ F | Search |
+| ⌘ 1 / ⌘ 2 / ⌘ , | Library / Now playing / Settings |
+
 ## Install
 
 Grab `Patina-<version>.dmg` from [Releases](https://github.com/diegodscamara/patina/releases) and drag Patina into Applications.
@@ -73,6 +83,7 @@ PATINA_ARCHS=native scripts/package.sh   # dist/Patina-<version>.dmg
 | `src/main.rs` | App state, update loop and views |
 | `src/spotify.rs` | Sign-in, librespot player, Web API calls |
 | `src/updater.rs` | Starts Sparkle when running from the installed app |
+| `src/settings.rs` | Preferences kept between launches (volume) |
 | `src/theme.rs` | Colours |
 | `assets/icon/` | Worn groove icon (SVG source, 1024 px PNG, `.icns`, menu bar glyph) |
 | `packaging/` | `Info.plist` template and entitlements |
