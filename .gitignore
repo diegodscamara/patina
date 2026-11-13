@@ -3,3 +3,4 @@
 .DS_Store
 *.p12
 sparkle_private_key*
+/.build

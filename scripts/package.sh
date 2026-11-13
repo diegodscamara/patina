@@ -58,8 +58,11 @@ sed -e "s|@VERSION@|$VERSION|g" \
 plutil -lint "$APP/Contents/Info.plist"
 
 # --- Sparkle -------------------------------------------------------------
-SPARKLE_DIR="$ROOT/target/sparkle-$SPARKLE_VERSION"
-if [[ ! -d "$SPARKLE_DIR" ]]; then
+# Kept outside target/: CI's Rust cache saves target/ and restores the framework
+# without its symlinks, which codesign then rejects.
+SPARKLE_DIR="$ROOT/.build/sparkle-$SPARKLE_VERSION"
+if [[ ! -L "$SPARKLE_DIR/Sparkle.framework/Versions/Current" ]]; then
+  rm -rf "$SPARKLE_DIR"
   log "Downloading Sparkle $SPARKLE_VERSION"
   mkdir -p "$SPARKLE_DIR"
   curl -fsSL "https://github.com/sparkle-project/Sparkle/releases/download/$SPARKLE_VERSION/Sparkle-$SPARKLE_VERSION.tar.xz" \

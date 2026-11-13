@@ -1,6 +1,7 @@
 //! Patina: a small, native Spotify player for macOS.
 
 mod icons;
+mod settings;
 mod spotify;
 mod theme;
 mod updater;
@@ -8,12 +9,22 @@ mod updater;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use iced::keyboard::{self, Key, Modifiers, key::Named};
 use iced::widget::{
     Space, button, column, container, image, row, scrollable, slider, svg, text, text_input,
 };
-use iced::{Alignment, Background, Border, Element, Length, Size, Task, Theme};
+use iced::{
+    Alignment, Background, Border, Element, Length, Size, Subscription, Task, Theme, event,
+};
 
+use settings::Settings;
 use spotify::{PlaybackEvent, Playlist, Spotify, Track};
+
+/// Id of the search field, so Cmd+F can focus it.
+const SEARCH_INPUT: &str = "search";
+
+/// How much Cmd+Up / Cmd+Down change the volume.
+const VOLUME_STEP: f32 = 0.1;
 
 pub fn main() -> iced::Result {
     tracing_subscriber::fmt()
@@ -26,6 +37,7 @@ pub fn main() -> iced::Result {
     iced::application(Patina::boot, Patina::update, Patina::view)
         .title("Patina")
         .theme(|_: &Patina| theme::theme())
+        .subscription(Patina::subscription)
         .window_size(Size::new(1180.0, 760.0))
         .run()
 }
@@ -36,6 +48,8 @@ enum Page {
     Search,
     NowPlaying,
     Settings,
+    /// A playlist from the sidebar, by index into `Patina::playlists`.
+    Playlist(usize),
 }
 
 #[derive(Debug)]
@@ -58,6 +72,13 @@ enum Message {
     SearchLoaded(Result<Vec<Track>, String>),
     PlayLiked(usize),
     PlayResult(usize),
+    OpenPlaylist(usize),
+    PlaylistLoaded(String, Result<Vec<Track>, String>),
+    PlayPlaylist(usize),
+    Volume(f32),
+    VolumeStep(f32),
+    VolumeDone,
+    FocusSearch,
     TogglePlay,
     Next,
     Previous,
@@ -84,6 +105,9 @@ struct Patina {
     /// Where the user is dragging the progress slider, before release.
     seek_to: Option<u32>,
     art: HashMap<String, image::Handle>,
+    /// Loaded playlist tracks, by playlist id.
+    playlist_tracks: HashMap<String, Vec<Track>>,
+    settings: Settings,
     error: Option<String>,
 }
 
@@ -105,6 +129,8 @@ impl Patina {
             position_ms: 0,
             seek_to: None,
             art: HashMap::new(),
+            playlist_tracks: HashMap::new(),
+            settings: Settings::load(),
             error: None,
         };
 
@@ -136,6 +162,7 @@ impl Patina {
                 connect(true)
             }
             Message::Connected(Ok(client)) => {
+                client.set_volume(self.settings.volume);
                 self.account = Account::Connected(client.clone());
                 let liked = client.clone();
                 let lists = client.clone();
@@ -205,6 +232,57 @@ impl Patina {
             Message::PlayResult(index) => {
                 self.queue = self.results.clone();
                 self.play(index)
+            }
+            Message::OpenPlaylist(index) => {
+                self.page = Page::Playlist(index);
+                let (Some(client), Some(playlist)) = (self.client(), self.playlists.get(index))
+                else {
+                    return Task::none();
+                };
+                if self.playlist_tracks.contains_key(&playlist.id) {
+                    return Task::none();
+                }
+                let id = playlist.id.clone();
+                Task::perform(
+                    {
+                        let id = id.clone();
+                        async move { client.playlist_tracks(&id).await.map_err(|e| e.to_string()) }
+                    },
+                    move |result| Message::PlaylistLoaded(id.clone(), result),
+                )
+            }
+            Message::PlaylistLoaded(id, result) => {
+                match result {
+                    Ok(tracks) => {
+                        self.playlist_tracks.insert(id, tracks);
+                    }
+                    Err(e) => self.error = Some(e),
+                }
+                Task::none()
+            }
+            Message::PlayPlaylist(index) => {
+                let Some(tracks) = self.open_playlist_tracks() else {
+                    return Task::none();
+                };
+                self.queue = tracks.to_vec();
+                self.play(index)
+            }
+            Message::Volume(volume) => {
+                self.set_volume(volume);
+                Task::none()
+            }
+            Message::VolumeStep(delta) => {
+                self.set_volume(self.settings.volume + delta);
+                self.settings.save();
+                Task::none()
+            }
+            Message::VolumeDone => {
+                self.settings.save();
+                Task::none()
+            }
+            Message::FocusSearch => {
+                self.page = Page::Search;
+                iced::widget::operation::focus(SEARCH_INPUT)
             }
             Message::TogglePlay => {
                 let Some(client) = self.client() else {
@@ -279,6 +357,32 @@ impl Patina {
         }
     }
 
+    fn subscription(&self) -> Subscription<Message> {
+        event::listen_with(|event, status, _window| match (event, status) {
+            (
+                iced::Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. }),
+                event::Status::Ignored,
+            ) => shortcut(key.as_ref(), modifiers),
+            _ => None,
+        })
+    }
+
+    fn set_volume(&mut self, volume: f32) {
+        self.settings.volume = volume.clamp(0.0, 1.0);
+        if let Some(client) = self.client() {
+            client.set_volume(self.settings.volume);
+        }
+    }
+
+    /// Tracks of the playlist shown now, if it has loaded.
+    fn open_playlist_tracks(&self) -> Option<&[Track]> {
+        let Page::Playlist(index) = self.page else {
+            return None;
+        };
+        let playlist = self.playlists.get(index)?;
+        self.playlist_tracks.get(&playlist.id).map(Vec::as_slice)
+    }
+
     /// Plays `queue[index]` and fetches its cover if we don't have it yet.
     fn play(&mut self, index: usize) -> Task<Message> {
         let (Some(client), Some(track)) = (self.client(), self.queue.get(index).cloned()) else {
@@ -326,6 +430,7 @@ impl Patina {
             (Account::Connected(_), Page::Library) => self.library(),
             (Account::Connected(_), Page::Search) => self.search(),
             (Account::Connected(_), Page::NowPlaying) => self.now_playing_page(),
+            (Account::Connected(_), Page::Playlist(index)) => self.playlist_page(index),
             (account, _) => sign_in(account),
         };
 
@@ -352,9 +457,15 @@ impl Patina {
         };
 
         let mut lists = column![].spacing(2);
-        for playlist in &self.playlists {
-            lists = lists
-                .push(container(text(&playlist.name).size(13).color(theme::ASH)).padding([5, 10]));
+        for (i, playlist) in self.playlists.iter().enumerate() {
+            let selected = self.page == Page::Playlist(i);
+            lists = lists.push(
+                button(text(&playlist.name).size(13))
+                    .width(Length::Fill)
+                    .padding([5, 10])
+                    .style(move |_: &Theme, status| nav_style(selected, status))
+                    .on_press(Message::OpenPlaylist(i)),
+            );
         }
 
         let sidebar = column![
@@ -435,8 +546,34 @@ impl Patina {
             .into()
     }
 
+    fn playlist_page(&self, index: usize) -> Element<'_, Message> {
+        let Some(playlist) = self.playlists.get(index) else {
+            return text("Playlist not found.").color(theme::ASH).into();
+        };
+        let mut page = column![text(&playlist.name).size(30).color(theme::BONE)].spacing(16);
+        match self.playlist_tracks.get(&playlist.id) {
+            Some(tracks) => {
+                page = page.push(
+                    text(format!("{} songs", tracks.len()))
+                        .size(13)
+                        .color(theme::ASH),
+                );
+                page.push(self.track_list(tracks, Message::PlayPlaylist))
+                    .into()
+            }
+            None => page
+                .push(
+                    text(self.error.as_deref().unwrap_or("Loading…"))
+                        .size(13)
+                        .color(theme::ASH),
+                )
+                .into(),
+        }
+    }
+
     fn search(&self) -> Element<'_, Message> {
         let input = text_input("Songs, artists, albums", &self.query)
+            .id(SEARCH_INPUT)
             .on_input(Message::QueryChanged)
             .on_submit(Message::Search)
             .padding(12)
@@ -637,7 +774,31 @@ impl Patina {
             .align_x(Alignment::Center)
             .width(Length::Fill);
 
-        let bar = row![info, center, Space::new().width(300)]
+        let volume = row![
+            svg(icons::volume())
+                .width(18)
+                .height(18)
+                .style(|_, _| svg::Style {
+                    color: Some(theme::ASH),
+                }),
+            slider(0.0..=1.0, self.settings.volume, Message::Volume)
+                .step(0.01_f32)
+                .on_release(Message::VolumeDone)
+                .width(120)
+                .style(|theme: &Theme, status| {
+                    let mut style = slider::default(theme, status);
+                    style.rail.backgrounds = (
+                        Background::Color(theme::ASH),
+                        Background::Color(theme::RAISED),
+                    );
+                    style.handle.background = Background::Color(theme::BONE);
+                    style
+                }),
+        ]
+        .spacing(10)
+        .align_y(Alignment::Center);
+
+        let bar = row![info, center, container(volume).width(300).align_right(300),]
             .align_y(Alignment::Center)
             .padding([0, 20]);
 
@@ -683,6 +844,23 @@ fn sign_in(account: &Account) -> Element<'_, Message> {
     .into()
 }
 
+/// Maps a key press that no widget took to a message. Cmd is Ctrl off macOS.
+fn shortcut(key: Key<&str>, modifiers: Modifiers) -> Option<Message> {
+    let command = modifiers.command();
+    Some(match (key, command) {
+        (Key::Named(Named::Space), false) => Message::TogglePlay,
+        (Key::Named(Named::ArrowRight), true) => Message::Next,
+        (Key::Named(Named::ArrowLeft), true) => Message::Previous,
+        (Key::Named(Named::ArrowUp), true) => Message::VolumeStep(VOLUME_STEP),
+        (Key::Named(Named::ArrowDown), true) => Message::VolumeStep(-VOLUME_STEP),
+        (Key::Character("f"), true) => Message::FocusSearch,
+        (Key::Character("1"), true) => Message::Navigate(Page::Library),
+        (Key::Character("2"), true) => Message::Navigate(Page::NowPlaying),
+        (Key::Character(","), true) => Message::Navigate(Page::Settings),
+        _ => return None,
+    })
+}
+
 fn connect(allow_browser: bool) -> Task<Message> {
     Task::perform(
         async move {
@@ -723,12 +901,33 @@ fn format_duration(ms: u32) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::format_duration;
+    use super::*;
 
     #[test]
     fn formats_durations() {
         assert_eq!(format_duration(0), "0:00");
         assert_eq!(format_duration(59_999), "0:59");
         assert_eq!(format_duration(318_000), "5:18");
+    }
+
+    #[test]
+    fn maps_shortcuts() {
+        let none = Modifiers::empty();
+        let cmd = Modifiers::COMMAND;
+        assert!(matches!(
+            shortcut(Key::Named(Named::Space), none),
+            Some(Message::TogglePlay)
+        ));
+        assert!(matches!(
+            shortcut(Key::Named(Named::ArrowRight), cmd),
+            Some(Message::Next)
+        ));
+        assert!(matches!(
+            shortcut(Key::Character("f"), cmd),
+            Some(Message::FocusSearch)
+        ));
+        // Plain letters and arrows are left alone.
+        assert!(shortcut(Key::Character("f"), none).is_none());
+        assert!(shortcut(Key::Named(Named::ArrowRight), none).is_none());
     }
 }

@@ -23,10 +23,12 @@ use librespot::core::spotify_id::SpotifyId;
 use librespot::oauth::OAuthClientBuilder;
 use librespot::playback::audio_backend;
 use librespot::playback::config::{AudioFormat, Bitrate, PlayerConfig};
-use librespot::playback::mixer::NoOpVolume;
+use librespot::playback::mixer::softmixer::SoftMixer;
+use librespot::playback::mixer::{Mixer, MixerConfig};
 use librespot::playback::player::{Player, PlayerEvent};
 use rspotify::clients::{BaseClient, OAuthClient};
-use rspotify::model::{FullTrack, SearchResult, SearchType};
+use rspotify::model::{FullTrack, PlayableItem, PlaylistId, SearchResult, SearchType};
+use rspotify::prelude::Id;
 use rspotify::{AuthCodeSpotify, Token};
 
 /// Port for the OAuth redirect listener. Must match librespot's registered
@@ -51,6 +53,12 @@ const OAUTH_SCOPES: &[&str] = &[
 /// Scopes for Web API tokens pulled from the session.
 const WEB_API_SCOPES: &str =
     "user-library-read,playlist-read-private,playlist-read-collaborative,user-read-private";
+
+/// Web API page size (Spotify's maximum).
+const PAGE: u32 = 50;
+
+/// Stop paging long lists here, so huge libraries still load quickly.
+const MAX_TRACKS: usize = 5000;
 
 /// A track as the UI shows it.
 #[derive(Debug, Clone)]
@@ -112,9 +120,8 @@ impl PlaybackEvent {
     }
 }
 
-/// A playlist row for the sidebar.
+/// A playlist row for the sidebar. `id` is the bare base62 id.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // `id` is used once playlists open in the main view
 pub struct Playlist {
     pub id: String,
     pub name: String,
@@ -124,6 +131,7 @@ pub struct Playlist {
 pub struct Spotify {
     session: Session,
     player: Arc<Player>,
+    mixer: SoftMixer,
 }
 
 impl std::fmt::Debug for Spotify {
@@ -190,15 +198,20 @@ impl Spotify {
             position_update_interval: Some(std::time::Duration::from_secs(1)),
             ..PlayerConfig::default()
         };
+        let mixer = SoftMixer::open(MixerConfig::default())?;
         let backend = audio_backend::find(None).ok_or_else(|| anyhow!("no audio backend"))?;
         let player = Player::new(
             player_config,
             session.clone(),
-            Box::new(NoOpVolume),
+            mixer.get_soft_volume(),
             move || backend(None, AudioFormat::default()),
         );
 
-        Ok(Self { session, player })
+        Ok(Self {
+            session,
+            player,
+            mixer,
+        })
     }
 
     pub fn username(&self) -> String {
@@ -217,31 +230,69 @@ impl Spotify {
         }))
     }
 
-    /// The first page of the user's liked songs.
+    /// All of the user's liked songs, newest first.
     pub async fn liked_songs(&self) -> Result<Vec<Track>> {
         let api = self.web_api().await?;
-        let page = api
-            .current_user_saved_tracks_manual(None, Some(50), Some(0))
-            .await?;
-        Ok(page
-            .items
-            .into_iter()
-            .filter_map(|saved| Track::from_full(saved.track))
-            .collect())
+        let mut tracks = Vec::new();
+        let mut offset = 0;
+        loop {
+            let page = api
+                .current_user_saved_tracks_manual(None, Some(PAGE), Some(offset))
+                .await?;
+            let more = page.next.is_some();
+            tracks.extend(
+                page.items
+                    .into_iter()
+                    .filter_map(|saved| Track::from_full(saved.track)),
+            );
+            if !more || tracks.len() >= MAX_TRACKS {
+                return Ok(tracks);
+            }
+            offset += PAGE;
+        }
     }
 
     /// The user's playlists, for the sidebar.
     pub async fn playlists(&self) -> Result<Vec<Playlist>> {
         let api = self.web_api().await?;
-        let page = api.current_user_playlists_manual(Some(50), Some(0)).await?;
-        Ok(page
-            .items
-            .into_iter()
-            .map(|p| Playlist {
-                id: p.id.to_string(),
+        let mut lists = Vec::new();
+        let mut offset = 0;
+        loop {
+            let page = api
+                .current_user_playlists_manual(Some(PAGE), Some(offset))
+                .await?;
+            let more = page.next.is_some();
+            lists.extend(page.items.into_iter().map(|p| Playlist {
+                id: p.id.id().to_string(),
                 name: p.name,
-            })
-            .collect())
+            }));
+            if !more {
+                return Ok(lists);
+            }
+            offset += PAGE;
+        }
+    }
+
+    /// The tracks of a playlist, skipping episodes and local files.
+    pub async fn playlist_tracks(&self, id: &str) -> Result<Vec<Track>> {
+        let api = self.web_api().await?;
+        let id = PlaylistId::from_id(id).map_err(|e| anyhow!("bad playlist id: {e}"))?;
+        let mut tracks = Vec::new();
+        let mut offset = 0;
+        loop {
+            let page = api
+                .playlist_items_manual(id.as_ref(), None, None, Some(PAGE), Some(offset))
+                .await?;
+            let more = page.next.is_some();
+            tracks.extend(page.items.into_iter().filter_map(|item| match item.item {
+                Some(PlayableItem::Track(track)) if !item.is_local => Track::from_full(track),
+                _ => None,
+            }));
+            if !more || tracks.len() >= MAX_TRACKS {
+                return Ok(tracks);
+            }
+            offset += PAGE;
+        }
     }
 
     /// Searches tracks.
@@ -289,6 +340,13 @@ impl Spotify {
         let id = SpotifyId::from_base62(base62).map_err(|e| anyhow!("bad track id: {e}"))?;
         self.player.load(SpotifyUri::Track { id }, true, 0);
         Ok(())
+    }
+
+    /// Volume from 0.0 to 1.0.
+    pub fn set_volume(&self, volume: f32) {
+        let volume = volume.clamp(0.0, 1.0);
+        self.mixer
+            .set_volume((volume * f32::from(u16::MAX)).round() as u16);
     }
 
     pub fn pause(&self) {
